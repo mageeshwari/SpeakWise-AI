@@ -1,0 +1,23 @@
+# SpeakWise AI — optional local speech/NLP sidecar
+#
+# The current WebDev MVP runs on Node.js and does not start a Python process.
+# These dependencies prepare the future FastAPI service for local transcription,
+# deterministic language analysis, and provider adapters.
+# Recommended runtime: Python 3.11+
+
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9,<1.0
+pydantic-settings>=2.6,<3.0
+python-dotenv>=1.0,<2.0ī
+httpx>=0.27,<1.0
+
+# Local text analysis
+spacy>=3.7,<4.0
+language-tool-python>=2.8,<3.0
+
+# Local speech transcription and audio handling
+openai-whisper>=20240930
+soundfile>=0.12,<1.0
+numpy>=1.26,<3.0
+ī
