@@ -74,89 +74,82 @@ export async function transcribeAudio(
   options: TranscribeOptions
 ): Promise<TranscriptionResponse | TranscriptionError> {
   try {
-    // Step 1: Validate environment configuration
-    if (!ENV.forgeApiUrl) {
-      return {
-        error: "Voice transcription service is not configured",
-        code: "SERVICE_ERROR",
-        details: "BUILT_IN_FORGE_API_URL is not set"
-      };
-    }
-    if (!ENV.forgeApiKey) {
+    const providerKey = ENV.elevenLabsApiKey || ENV.forgeApiKey;
+    const modelId = process.env.ELEVENLABS_MODEL_ID || "scribe_v1";
+    const mimeType = options.mimeType || "audio/mpeg";
+
+    if (!providerKey) {
       return {
         error: "Voice transcription service authentication is missing",
         code: "SERVICE_ERROR",
-        details: "BUILT_IN_FORGE_API_KEY is not set"
+        details: "Set ELEVENLABS_API_KEY or BUILT_IN_FORGE_API_KEY before running transcription"
       };
     }
 
-    // Step 2: Download audio from URL
     let audioBuffer: Buffer;
-    let mimeType: string;
-    try {
-      const response = await fetch(options.audioUrl);
-      if (!response.ok) {
+    if (options.audioBase64) {
+      try {
+        audioBuffer = Buffer.from(options.audioBase64, "base64");
+      } catch (error) {
         return {
-          error: "Failed to download audio file",
+          error: "Invalid audio payload",
           code: "INVALID_FORMAT",
-          details: `HTTP ${response.status}: ${response.statusText}`
+          details: error instanceof Error ? error.message : "Audio payload could not be decoded"
         };
       }
-      
-      audioBuffer = Buffer.from(await response.arrayBuffer());
-      mimeType = response.headers.get('content-type') || 'audio/mpeg';
-      
-      // Check file size (16MB limit)
-      const sizeMB = audioBuffer.length / (1024 * 1024);
-      if (sizeMB > 16) {
+    } else if (options.audioUrl) {
+      try {
+        const response = await fetch(options.audioUrl);
+        if (!response.ok) {
+          return {
+            error: "Failed to download audio file",
+            code: "INVALID_FORMAT",
+            details: `HTTP ${response.status}: ${response.statusText}`
+          };
+        }
+        audioBuffer = Buffer.from(await response.arrayBuffer());
+      } catch (error) {
         return {
-          error: "Audio file exceeds maximum size limit",
-          code: "FILE_TOO_LARGE",
-          details: `File size is ${sizeMB.toFixed(2)}MB, maximum allowed is 16MB`
+          error: "Failed to fetch audio file",
+          code: "SERVICE_ERROR",
+          details: error instanceof Error ? error.message : "Unknown error"
         };
       }
-    } catch (error) {
+    } else {
       return {
-        error: "Failed to fetch audio file",
-        code: "SERVICE_ERROR",
-        details: error instanceof Error ? error.message : "Unknown error"
+        error: "No audio source supplied",
+        code: "INVALID_FORMAT",
+        details: "Provide audioBase64 or audioUrl before transcription"
       };
     }
 
-    // Step 3: Create FormData for multipart upload to Whisper API
+    const sizeMB = audioBuffer.length / (1024 * 1024);
+    if (sizeMB > 16) {
+      return {
+        error: "Audio file exceeds maximum size limit",
+        code: "FILE_TOO_LARGE",
+        details: `File size is ${sizeMB.toFixed(2)}MB, maximum allowed is 16MB`
+      };
+    }
+
     const formData = new FormData();
-    
-    // Create a Blob from the buffer and append to form
     const filename = `audio.${getFileExtension(mimeType)}`;
     const audioBlob = new Blob([new Uint8Array(audioBuffer)], { type: mimeType });
     formData.append("file", audioBlob, filename);
-    
-    formData.append("model", "whisper-1");
-    formData.append("response_format", "verbose_json");
-    
-    // Add prompt - use custom prompt if provided, otherwise generate based on language
-    const prompt = options.prompt || (
-      options.language 
-        ? `Transcribe the user's voice to text, the user's working language is ${getLanguageName(options.language)}`
-        : "Transcribe the user's voice to text"
-    );
+    formData.append("model_id", modelId);
+
+    const languageCode = options.language || "en";
+    if (languageCode) {
+      formData.append("language_code", languageCode);
+    }
+
+    const prompt = options.prompt || `Transcribe the user's voice to text using ${getLanguageName(languageCode)}.`;
     formData.append("prompt", prompt);
 
-    // Step 4: Call the transcription service
-    const baseUrl = ENV.forgeApiUrl.endsWith("/")
-      ? ENV.forgeApiUrl
-      : `${ENV.forgeApiUrl}/`;
-    
-    const fullUrl = new URL(
-      "v1/audio/transcriptions",
-      baseUrl
-    ).toString();
-
-    const response = await fetch(fullUrl, {
+    const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
       method: "POST",
       headers: {
-        authorization: `Bearer ${ENV.forgeApiKey}`,
-        "Accept-Encoding": "identity",
+        "xi-api-key": providerKey,
       },
       body: formData,
     });
@@ -170,22 +163,46 @@ export async function transcribeAudio(
       };
     }
 
-    // Step 5: Parse and return the transcription result
-    const whisperResponse = await response.json() as WhisperResponse;
-    
-    // Validate response structure
-    if (!whisperResponse.text || typeof whisperResponse.text !== 'string') {
+    const payload = await response.json() as any;
+    const text = typeof payload.text === "string"
+      ? payload.text
+      : typeof payload.transcript === "string"
+        ? payload.transcript
+        : typeof payload.output === "string"
+          ? payload.output
+          : "";
+
+    if (!text) {
       return {
         error: "Invalid transcription response",
         code: "SERVICE_ERROR",
-        details: "Transcription service returned an invalid response format"
+        details: "The transcription provider returned no text"
       };
     }
 
-    return whisperResponse; // Return native Whisper API response directly
+    const segments: WhisperSegment[] = Array.isArray(payload.segments)
+      ? payload.segments.map((segment: any, index: number) => ({
+          id: Number(segment.id ?? index + 1),
+          seek: Number(segment.seek ?? 0),
+          start: Number(segment.start ?? 0),
+          end: Number(segment.end ?? 0),
+          text: String(segment.text ?? text),
+          tokens: Array.isArray(segment.tokens) ? segment.tokens : [],
+          temperature: Number(segment.temperature ?? 0),
+          avg_logprob: Number(segment.avg_logprob ?? 0),
+          compression_ratio: Number(segment.compression_ratio ?? 0),
+          no_speech_prob: Number(segment.no_speech_prob ?? 0),
+        }))
+      : [];
 
+    return {
+      task: "transcribe",
+      language: payload.language_code || languageCode || "en",
+      duration: Number(payload.duration ?? 0),
+      text,
+      segments,
+    };
   } catch (error) {
-    // Handle unexpected errors
     return {
       error: "Voice transcription failed",
       code: "SERVICE_ERROR",

@@ -102,6 +102,39 @@ export const appRouter = router({
       return { success: true } as const;
     }),
   }),
+  voice: router({
+    transcribe: publicProcedure.input(z.object({
+      audioBase64: z.string().min(1),
+      mimeType: z.string().default("audio/webm"),
+      language: z.string().optional(),
+      prompt: z.string().optional(),
+    })).mutation(async ({ input }) => {
+      const { transcribeAudio } = await import("./_core/voiceTranscription");
+      const result = await transcribeAudio({
+        audioBase64: input.audioBase64,
+        mimeType: input.mimeType,
+        language: input.language,
+        prompt: input.prompt,
+      });
+
+      if ("error" in result) {
+        return {
+          ok: false,
+          error: result.error,
+          code: result.code,
+          details: result.details,
+        };
+      }
+
+      return {
+        ok: true,
+        text: result.text,
+        language: result.language,
+        duration: result.duration,
+        segments: result.segments,
+      };
+    }),
+  }),
   speakwise: router({
     dashboard: publicProcedure.query(() => dashboardData),
     leaderboard: publicProcedure.query(() => demoLeaderboard),

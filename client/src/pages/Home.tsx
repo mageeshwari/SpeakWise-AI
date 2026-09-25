@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { trpc } from "@/lib/trpc";
 import {
   AudioLines,
@@ -159,23 +159,115 @@ function SpeakPage({ initialMode = "text" as AnalyzeMode }: { initialMode?: Anal
   const [duration, setDuration] = useState(60);
   const [isRecording, setIsRecording] = useState(false);
   const [result, setResult] = useState<any>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
   const analyze = trpc.speakwise.analyzeText.useMutation({ onSuccess: setResult });
   const metrics = trpc.speakwise.speechMetrics.useMutation({ onSuccess: setResult });
-  const startRecording = () => {
+  const voiceTranscribe = trpc.voice.transcribe.useMutation({
+    onSuccess: (response) => {
+      if (!response.ok) {
+        console.error(response.error ?? "Voice transcription failed");
+        setIsRecording(false);
+        return;
+      }
+      setText(response.text ?? text);
+      setIsRecording(false);
+    },
+    onError: (error) => {
+      console.error(error);
+      setIsRecording(false);
+    },
+  });
+
+  const blobToBase64 = (blob: Blob) => new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = typeof reader.result === "string" ? reader.result.split(",")[1] : "";
+      resolve(result);
+    };
+    reader.onerror = () => reject(new Error("Failed to read audio blob"));
+    reader.readAsDataURL(blob);
+  });
+
+  const startRecording = async () => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) { setIsRecording(true); return; }
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.onresult = (event: any) => { let transcript = ""; for (let i = event.resultIndex; i < event.results.length; i++) transcript += event.results[i][0].transcript; setText((previous) => `${previous === "" ? "" : previous + " "}${transcript}`.trim()); };
-    recognition.onend = () => setIsRecording(false);
-    recognition.start();
-    setIsRecording(true);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      if (!SpeechRecognition) {
+        setIsRecording(true);
+        return;
+      }
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.onresult = (event: any) => {
+        let transcript = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) transcript += event.results[i][0].transcript;
+        setText((previous) => `${previous === "" ? "" : previous + " "}${transcript}`.trim());
+      };
+      recognition.onend = () => setIsRecording(false);
+      recognition.start();
+      setIsRecording(true);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+      const recorder = new MediaRecorder(stream, { mimeType });
+      const chunks: BlobPart[] = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: mimeType });
+        const base64 = await blobToBase64(blob);
+        voiceTranscribe.mutate({
+          audioBase64: base64,
+          mimeType,
+          language: "en",
+          prompt: "Transcribe the user’s spoken English accurately and naturally.",
+        });
+        stream.getTracks().forEach((track) => track.stop());
+      };
+
+      recorderRef.current = recorder;
+      recorder.start();
+      setIsRecording(true);
+    } catch (error) {
+      console.error("Microphone access failed", error);
+      const recognition = SpeechRecognition && new (SpeechRecognition as any)();
+      if (recognition) {
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.onresult = (event: any) => {
+          let transcript = "";
+          for (let i = event.resultIndex; i < event.results.length; i++) transcript += event.results[i][0].transcript;
+          setText((previous) => `${previous === "" ? "" : previous + " "}${transcript}`.trim());
+        };
+        recognition.onend = () => setIsRecording(false);
+        recognition.start();
+        setIsRecording(true);
+      }
+    }
   };
-  const stopRecording = () => setIsRecording(false);
+
+  const stopRecording = () => {
+    if (recorderRef.current && recorderRef.current.state !== "inactive") {
+      recorderRef.current.stop();
+    }
+    setIsRecording(false);
+  };
+
   const runAnalysis = () => mode === "speech" ? metrics.mutate({ transcript: text, durationSeconds: duration }) : analyze.mutate({ text, mode: "text" });
-  const loading = analyze.isPending || metrics.isPending;
-  return <div className="fade-up mx-auto max-w-[1240px] space-y-6 p-5 md:p-10"><SectionHeading eyebrow="Speak lab" title="Turn practice into progress." description="Write it, say it, or paste a thought. SpeakWise will show you what is working and what to try next." /><div className="flex flex-wrap gap-2 rounded-2xl border border-[#e2e5df] bg-white p-2 shadow-sm"><button onClick={() => setMode("text")} className={classNames("pressable flex items-center gap-2 rounded-xl px-4 py-2.5 text-[12px] font-bold", mode === "text" ? "bg-[#4352c7] text-white" : "text-[#697477] hover:bg-[#f0f1ec]")}><WandSparkles size={15} /> Text analysis</button><button onClick={() => setMode("speech")} className={classNames("pressable flex items-center gap-2 rounded-xl px-4 py-2.5 text-[12px] font-bold", mode === "speech" ? "bg-[#4352c7] text-white" : "text-[#697477] hover:bg-[#f0f1ec]")}><AudioLines size={15} /> Speech analysis</button></div><div className="grid gap-5 xl:grid-cols-[.96fr_1.04fr]"><div className="soft-card rounded-[24px] bg-white p-6 md:p-7"><div className="mb-5 flex items-center justify-between"><div><p className="text-[10px] font-bold uppercase tracking-[.16em] text-[#9aa29d]">Your input</p><h2 className="mt-1 font-display text-[24px] font-semibold">{mode === "speech" ? "Say what you mean." : "Write as you would speak."}</h2></div>{mode === "speech" && <span className="rounded-full bg-[#fff0bf] px-3 py-1.5 text-[10px] font-bold text-[#896b14]">Local transcription</span>}</div><textarea value={text} onChange={(event) => setText(event.target.value)} className="min-h-[230px] w-full resize-none rounded-[18px] border border-[#e2e5df] bg-[#fcfcf9] p-4 text-[15px] leading-7 outline-none transition focus:border-[#9ca4f5] focus:ring-4 focus:ring-[#e6e7fc]" placeholder="Tell me about a recent experience..." /><div className="mt-4 flex flex-wrap items-center gap-3">{mode === "speech" && <button onClick={isRecording ? stopRecording : startRecording} className={classNames("pressable inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-[12px] font-bold", isRecording ? "bg-[#f5b2a5] text-[#87483e]" : "bg-[#d7f0e5] text-[#347054]")}><Mic2 size={15} /> {isRecording ? "Stop listening" : "Use microphone"}</button>}<button disabled={!text.trim() || loading} onClick={runAnalysis} className="pressable inline-flex items-center gap-2 rounded-xl bg-[#4352c7] px-4 py-2.5 text-[12px] font-bold text-white shadow-[0_8px_18px_rgba(67,82,199,.18)] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RotateCcw className="animate-spin" size={15} /> : <Sparkles size={15} />} {loading ? "Analyzing..." : "Analyze my English"}</button>{mode === "speech" && <label className="flex items-center gap-2 text-[11px] text-[#89928f]"><Clock3 size={14} /> <input type="number" min={1} value={duration} onChange={(event) => setDuration(Number(event.target.value))} className="w-14 rounded-lg border border-[#e2e5df] bg-[#fcfcf9] px-2 py-1.5 text-center font-semibold text-[#1e2526]" /> sec</label>}</div><p className="mt-4 flex items-center gap-2 text-[11px] leading-5 text-[#89928f]"><ShieldCheck size={14} className="text-[#62a989]" /> Raw audio is temporary by default. Scores are application metrics, not certification.</p></div><AnalysisResult result={result} mode={mode} /></div></div>;
+  const loading = analyze.isPending || metrics.isPending || voiceTranscribe.isPending;
+  return <div className="fade-up mx-auto max-w-[1240px] space-y-6 p-5 md:p-10"><SectionHeading eyebrow="Speak lab" title="Turn practice into progress." description="Write it, say it, or paste a thought. SpeakWise will show you what is working and what to try next." /><div className="flex flex-wrap gap-2 rounded-2xl border border-[#e2e5df] bg-white p-2 shadow-sm"><button onClick={() => setMode("text")} className={classNames("pressable flex items-center gap-2 rounded-xl px-4 py-2.5 text-[12px] font-bold", mode === "text" ? "bg-[#4352c7] text-white" : "text-[#697477] hover:bg-[#f0f1ec]")}><WandSparkles size={15} /> Text analysis</button><button onClick={() => setMode("speech")} className={classNames("pressable flex items-center gap-2 rounded-xl px-4 py-2.5 text-[12px] font-bold", mode === "speech" ? "bg-[#4352c7] text-white" : "text-[#697477] hover:bg-[#f0f1ec]")}><AudioLines size={15} /> Speech analysis</button></div><div className="grid gap-5 xl:grid-cols-[.96fr_1.04fr]"><div className="soft-card rounded-[24px] bg-white p-6 md:p-7"><div className="mb-5 flex items-center justify-between"><div><p className="text-[10px] font-bold uppercase tracking-[.16em] text-[#9aa29d]">Your input</p><h2 className="mt-1 font-display text-[24px] font-semibold">{mode === "speech" ? "Say what you mean." : "Write as you would speak."}</h2></div>{mode === "speech" && <span className="rounded-full bg-[#fff0bf] px-3 py-1.5 text-[10px] font-bold text-[#896b14]">AI transcription</span>}</div><textarea value={text} onChange={(event) => setText(event.target.value)} className="min-h-[230px] w-full resize-none rounded-[18px] border border-[#e2e5df] bg-[#fcfcf9] p-4 text-[15px] leading-7 outline-none transition focus:border-[#9ca4f5] focus:ring-4 focus:ring-[#e6e7fc]" placeholder="Tell me about a recent experience..." /><div className="mt-4 flex flex-wrap items-center gap-3">{mode === "speech" && <button onClick={isRecording ? stopRecording : startRecording} className={classNames("pressable inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-[12px] font-bold", isRecording ? "bg-[#ef806c] text-white" : "bg-[#4352c7] text-white")}><Mic2 size={15} /> {isRecording ? "Stop recording" : "Record audio"}</button>}{mode === "speech" && <button onClick={() => setText("")} className="rounded-xl border border-[#e2e5df] bg-white px-4 py-2.5 text-[12px] font-bold text-[#697477]">Clear</button>}<button onClick={runAnalysis} disabled={loading || !text.trim()} className={classNames("pressable inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-[12px] font-bold text-white", loading || !text.trim() ? "cursor-not-allowed bg-[#a6adf4]" : "bg-[#1e2526]")}><Play size={15} /> {loading ? "Processing..." : mode === "speech" ? "Analyze speech" : "Analyze text"}</button></div>{mode === "speech" && <div className="mt-4 flex items-center justify-between rounded-2xl bg-[#f5f6f1] px-3 py-2 text-[11px] font-semibold text-[#697477]"><span>Duration</span><input type="number" min={15} max={300} value={duration} onChange={(event) => setDuration(Number(event.target.value || 60))} className="w-20 rounded-lg border border-[#e2e5df] bg-white px-2 py-1 text-right outline-none" /></div>}</div><div className="soft-card rounded-[24px] bg-white p-6 md:p-7"><AnalysisResult result={result} mode={mode} /></div></div></div>;
+}
+
+function AnalysisResult({ result, mode }: { result: any; mode: AnalyzeMode }) {
+ne-flex items-center gap-2 rounded-xl px-4 py-2.5 text-[12px] font-bold", isRecording ? "bg-[#f5b2a5] text-[#87483e]" : "bg-[#d7f0e5] text-[#347054]")}><Mic2 size={15} /> {isRecording ? "Stop listening" : "Use microphone"}</button>}<button disabled={!text.trim() || loading} onClick={runAnalysis} className="pressable inline-flex items-center gap-2 rounded-xl bg-[#4352c7] px-4 py-2.5 text-[12px] font-bold text-white shadow-[0_8px_18px_rgba(67,82,199,.18)] disabled:cursor-not-allowed disabled:opacity-50">{loading ? <RotateCcw className="animate-spin" size={15} /> : <Sparkles size={15} />} {loading ? "Analyzing..." : "Analyze my English"}</button>{mode === "speech" && <label className="flex items-center gap-2 text-[11px] text-[#89928f]"><Clock3 size={14} /> <input type="number" min={1} value={duration} onChange={(event) => setDuration(Number(event.target.value))} className="w-14 rounded-lg border border-[#e2e5df] bg-[#fcfcf9] px-2 py-1.5 text-center font-semibold text-[#1e2526]" /> sec</label>}</div><p className="mt-4 flex items-center gap-2 text-[11px] leading-5 text-[#89928f]"><ShieldCheck size={14} className="text-[#62a989]" /> Raw audio is temporary by default. Scores are application metrics, not certification.</p></div><AnalysisResult result={result} mode={mode} /></div></div>;
 }
 
 function AnalysisResult({ result, mode }: { result: any; mode: AnalyzeMode }) {
